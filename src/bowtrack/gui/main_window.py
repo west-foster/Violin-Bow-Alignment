@@ -20,11 +20,14 @@ from ..camera import CameraStream
 from ..config import resolve
 from ..feedback import BowFeedback, BowState, Feedback
 from ..geometry import CameraIntrinsics, FrameGeometry, GeometryEstimator, ViolinModel
-from ..keypoints import KEYPOINT_NAMES, Keypoints2D
-from ..overlay import draw_geometry, draw_keypoints
+from ..keypoints import KEYPOINT_KEYS, KEYPOINT_NAMES, Keypoints2D
+from ..overlay import draw_geometry, draw_keypoints, draw_model_fit
 from ..synthetic import DemoSource
 from ..video import VideoFile, VideoRecorder
+from .keypoint_guide import KeypointGuide
 from .view3d import View3DWindow
+
+SNAP_PX = 15  # bow clicks this close to the frame edge snap onto it (= "cut off by the frame")
 
 BANNER_STYLE = {
     BowState.OK: ("#1f9d3a", "#ffffff"),
@@ -33,6 +36,11 @@ BANNER_STYLE = {
     BowState.NO_BOW: ("#000000", "#bbbbbb"),
 }
 OVERLAY_BGR = {BowState.OK: (60, 210, 60), BowState.NO_BOW: (200, 200, 200)}
+
+
+def _needs_update(kps: dict) -> bool:
+    """Saved before some keypoints existed: those points were never labelled."""
+    return bool(AnnotationStore.missing(kps))
 
 
 class Mode(Enum):
@@ -178,13 +186,19 @@ class MainWindow(QtWidgets.QMainWindow):
         self.btn_demo.clicked.connect(self.start_demo)
         self.chk_model = QtWidgets.QCheckBox("Apply model")
         self.chk_model.toggled.connect(self.toggle_model)
+        self.chk_fit = QtWidgets.QCheckBox("Show fitted violin")
+        self.chk_fit.setChecked(True)
+        self.chk_fit.setToolTip("Draw the 3D violin model at the estimated pose over the frame. If the pose is "
+                                "right it lines up with the real violin.")
+        self.chk_fit.toggled.connect(lambda _: self._render())
         self.btn_3d = QtWidgets.QPushButton("Show 3D view")
-        self.btn_3d.clicked.connect(lambda: (self.view3d.show(), self.view3d.raise_()))
+        self.btn_3d.clicked.connect(self.show_3d)
         top = QtWidgets.QHBoxLayout()
         for w in (self.btn_camera, self.btn_record, self.btn_open, self.btn_demo):
             top.addWidget(w)
         top.addSpacing(20)
         top.addWidget(self.chk_model)
+        top.addWidget(self.chk_fit)
         top.addStretch(1)
         top.addWidget(self.btn_3d)
 
@@ -220,8 +234,10 @@ class MainWindow(QtWidgets.QMainWindow):
         self.kp_list = QtWidgets.QListWidget()
         for n in KEYPOINT_NAMES:
             self.kp_list.addItem(n)
+        self.kp_list.setFixedHeight(12 + 19 * len(KEYPOINT_NAMES))
+        self.guide = KeypointGuide(self.model)
+        self.kp_list.currentRowChanged.connect(self._on_kp_selected)
         self.kp_list.setCurrentRow(0)
-        self.kp_list.setMaximumHeight(170)
         self.btn_save_annot = QtWidgets.QPushButton("Save frame to dataset (S)")
         self.btn_save_annot.clicked.connect(self.save_annotation)
         self.btn_clear_annot = QtWidgets.QPushButton("Clear points")
@@ -231,14 +247,41 @@ class MainWindow(QtWidgets.QMainWindow):
         help_text = QtWidgets.QLabel(
             "<small>Left-click: place selected point (auto-advances)<br>"
             "Right-click: remove nearest point<br>"
-            "N: mark selected as not visible · 1-7: select point<br>"
-            "Space: play/pause · ←/→: step · Shift+←/→: ±10</small>"
+            "N: mark selected as not visible (✗)<br>"
+            "1-9, 0, F, T: select point · ✓ placed · · not labelled yet<br>"
+            "Space: play/pause · ←/→: step · Shift+←/→: ±10<br>"
+            "[ / ]: previous / next labelled frame</small>"
         )
         annot_box = QtWidgets.QGroupBox("Labelling")
         al = QtWidgets.QVBoxLayout(annot_box)
-        for w in (self.chk_annot, self.kp_list, self.btn_save_annot, self.btn_clear_annot, self.annot_status,
-                  help_text):
+        clear_row = QtWidgets.QHBoxLayout()
+        clear_row.addWidget(self.btn_save_annot, 1)
+        clear_row.addWidget(self.btn_clear_annot)
+        for w in (self.chk_annot, self.kp_list, self.guide):
             al.addWidget(w)
+        al.addLayout(clear_row)
+        al.addWidget(self.annot_status)
+        al.addWidget(help_text)
+
+        # Labelled-frame navigator.
+        self.labelled_list = QtWidgets.QListWidget()
+        self.labelled_list.setMinimumHeight(130)
+        self.labelled_list.itemActivated.connect(self._on_labelled_clicked)
+        self.labelled_list.itemClicked.connect(self._on_labelled_clicked)
+        self.btn_prev_lab = QtWidgets.QPushButton("◀ Prev [")
+        self.btn_next_lab = QtWidgets.QPushButton("Next ] ▶")
+        self.btn_del_lab = QtWidgets.QPushButton("Delete labels")
+        self.btn_del_lab.setToolTip("Remove this frame's labels and saved image from the dataset")
+        self.btn_prev_lab.clicked.connect(lambda: self.goto_labelled(-1))
+        self.btn_next_lab.clicked.connect(lambda: self.goto_labelled(1))
+        self.btn_del_lab.clicked.connect(self.delete_labels)
+        nav = QtWidgets.QHBoxLayout()
+        for w in (self.btn_prev_lab, self.btn_next_lab, self.btn_del_lab):
+            nav.addWidget(w)
+        lab_box = QtWidgets.QGroupBox("Labelled frames")
+        ll = QtWidgets.QVBoxLayout(lab_box)
+        ll.addWidget(self.labelled_list)
+        ll.addLayout(nav)
 
         self.info = QtWidgets.QLabel()
         self.info.setStyleSheet("font-family: Menlo, monospace; font-size: 12px;")
@@ -249,18 +292,25 @@ class MainWindow(QtWidgets.QMainWindow):
 
         right = QtWidgets.QVBoxLayout()
         right.addWidget(annot_box)
-        right.addWidget(info_box, 1)
+        right.addWidget(lab_box)
+        right.addWidget(info_box)
+        right.addStretch(1)
         right_w = QtWidgets.QWidget()
         right_w.setLayout(right)
-        right_w.setFixedWidth(320)
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidget(right_w)
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        scroll.setFixedWidth(350)
 
         root = QtWidgets.QHBoxLayout()
         root.addLayout(left, 1)
-        root.addWidget(right_w)
+        root.addWidget(scroll)
         central = QtWidgets.QWidget()
         central.setLayout(root)
         self.setCentralWidget(central)
         self._update_annot_status()
+        self._refresh_labelled_list()
 
     def _build_shortcuts(self) -> None:
         def sc(key, fn):
@@ -275,8 +325,10 @@ class MainWindow(QtWidgets.QMainWindow):
         sc("S", self.save_annotation)
         sc("N", self.mark_not_visible)
         sc("R", lambda: self.btn_record.isEnabled() and self.toggle_record())
-        for i in range(len(KEYPOINT_NAMES)):
-            sc(str(i + 1), lambda i=i: self.kp_list.setCurrentRow(i))
+        sc("[", lambda: self.goto_labelled(-1))
+        sc("]", lambda: self.goto_labelled(1))
+        for i, key in enumerate(KEYPOINT_KEYS):
+            sc(key, lambda i=i: self.kp_list.setCurrentRow(i))
 
     def _set_playback_enabled(self, on: bool) -> None:
         for w in (self.btn_first, self.btn_prev, self.btn_play, self.btn_next, self.slider):
@@ -298,6 +350,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.geo_local.reset()
         if self.worker is not None:
             self.worker.geometry.reset()
+        self._update_annot_status()
 
     def toggle_camera(self) -> None:
         if self.mode == Mode.LIVE:
@@ -325,7 +378,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self._demo_t0 = time.time()
         self.btn_record.setEnabled(True)
         self._set_playback_enabled(False)
-        self.view3d.show()
+        self.show_3d()
 
     def open_video_dialog(self) -> None:
         path, _ = QtWidgets.QFileDialog.getOpenFileName(
@@ -348,6 +401,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.slider.blockSignals(False)
         self._set_playback_enabled(True)
         self.setWindowTitle(f"bowtrack - {Path(path).name}")
+        self._refresh_labelled_list()
         self.seek(0)
 
     def toggle_record(self) -> None:
@@ -407,6 +461,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.slider.blockSignals(False)
         self.frame_text.setText(f"{idx + 1} / {len(self.video)}  ({idx / self.video.fps:.2f}s)")
         self.current_frame = frame
+        self._select_labelled_row()
         if self.chk_annot.isChecked():
             self._load_annotation_for_frame()
             self._render()
@@ -428,6 +483,7 @@ class MainWindow(QtWidgets.QMainWindow):
                 self.current_kp = self.current_geo = None
                 self._render(new_measurement=True)
         self._last_shown_idx = idx
+        self._update_annot_status()
 
     # ---------------------------------------------------------------- tick
     def _tick(self) -> None:
@@ -547,6 +603,7 @@ class MainWindow(QtWidgets.QMainWindow):
         if on:
             self.playing = False
             self.btn_play.setText("▶")
+            self.show_3d()  # check the pose as you click
             self._load_annotation_for_frame()
             self._render()
         else:
@@ -558,6 +615,9 @@ class MainWindow(QtWidgets.QMainWindow):
         stored = self.store.get(self._annot_file())
         if stored is not None:
             self.annot = dict(stored)
+            missing = AnnotationStore.missing(stored)
+            if missing:  # jump straight to the first point this frame still needs
+                self.kp_list.setCurrentRow(KEYPOINT_NAMES.index(missing[0]))
         elif self.frame_idx in self.results:  # pre-fill from the model to speed up labelling
             self.annot = self.results[self.frame_idx][0].to_dict(self.min_conf)
         else:
@@ -573,6 +633,9 @@ class MainWindow(QtWidgets.QMainWindow):
             if not (0 <= x < w and 0 <= y < h):
                 return
             name = KEYPOINT_NAMES[self.kp_list.currentRow()]
+            if name in ("bow_frog", "bow_tip"):  # bow leaving the frame: put the point exactly on the edge
+                x = 0.0 if x < SNAP_PX else (w - 1.0 if x > w - 1 - SNAP_PX else x)
+                y = 0.0 if y < SNAP_PX else (h - 1.0 if y > h - 1 - SNAP_PX else y)
             self.annot[name] = [float(x), float(y)]
             self._advance_selection()
         elif button == QtCore.Qt.RightButton:
@@ -615,6 +678,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.annot_dirty = False
         self.statusBar().showMessage(f"Saved labels for {self._annot_file()}", 3000)
         self._update_annot_status()
+        self._refresh_labelled_list()
 
     def _autosave_annotation(self) -> None:
         if self.chk_annot.isChecked() and self.annot_dirty:
@@ -623,11 +687,117 @@ class MainWindow(QtWidgets.QMainWindow):
     def _update_annot_status(self) -> None:
         for i, n in enumerate(KEYPOINT_NAMES):
             item = self.kp_list.item(i)
-            mark = "✓" if self.annot.get(n) is not None else "·"
-            item.setText(f"{i + 1}. {mark} {n}")
-        saved = self.mode == Mode.VIDEO and self.store.get(self._annot_file()) is not None
-        state = "unsaved changes" if self.annot_dirty else ("saved" if saved else "not labelled")
-        self.annot_status.setText(f"Dataset: {len(self.store)} labelled frames<br>This frame: {state}")
+            mark = "✓" if self.annot.get(n) is not None else ("✗" if n in self.annot else "·")
+            item.setText(f"{KEYPOINT_KEYS[i]}. {mark} {n}")
+        stored = self.store.get(self._annot_file()) if self.mode == Mode.VIDEO else None
+        state = "unsaved changes" if self.annot_dirty else ("saved" if stored is not None else "not labelled")
+        if stored is not None and not self.annot_dirty and _needs_update(stored):
+            todo = ", ".join(AnnotationStore.missing(stored))
+            state += f" <span style='color:#c62828'>(still needs: {todo})</span>"
+        if self.chk_annot.isChecked():
+            unplaced = [n for n in KEYPOINT_NAMES if n not in self.annot]
+            if unplaced and any(v is not None for v in self.annot.values()):
+                state += (f"<br><small>{len(unplaced)} point(s) not labelled yet; saving marks them "
+                          "not visible</small>")
+        n_fix = sum(_needs_update(e["keypoints"]) for e in self.store.entries())
+        fix = f"<br><span style='color:#c62828'>{n_fix} frames need the new points</span>" if n_fix else ""
+        self.annot_status.setText(f"Dataset: {len(self.store)} labelled frames{fix}<br>This frame: {state}")
+
+    def show_3d(self) -> None:
+        """Open the 3D window and draw the current frame's pose immediately."""
+        self.view3d.show()
+        self.view3d.raise_()
+        self.view3d.update_geometry(getattr(self, "_last_geo", None), getattr(self, "_last_state", "none"))
+
+    def _on_kp_selected(self, row: int) -> None:
+        if 0 <= row < len(KEYPOINT_NAMES):
+            self.guide.set_selected(KEYPOINT_NAMES[row])
+            if self.chk_annot.isChecked():
+                self._render()
+
+    # ------------------------------------------------- labelled-frame navigator
+    def _labelled_frames(self) -> list[tuple[str, int, dict]]:
+        """(take stem, frame index, keypoints) for every labelled frame, sorted."""
+        out = []
+        for e in self.store.entries():
+            stem, idx = Path(e["file"]).stem.rsplit("_", 1)
+            out.append((stem, int(idx), e["keypoints"]))
+        return sorted(out, key=lambda t: (t[0], t[1]))
+
+    def _refresh_labelled_list(self) -> None:
+        self.labelled_list.blockSignals(True)
+        self.labelled_list.clear()
+        current = self.video.path.stem if self.video is not None else None
+        for stem, idx, kps in self._labelled_frames():
+            todo = AnnotationStore.missing(kps)
+            placed = sum(kps.get(n) is not None for n in KEYPOINT_NAMES)
+            mark = f"⚠ needs {len(todo)} pts" if todo else f"✓ {placed}/{len(KEYPOINT_NAMES)}"
+            where = f"frame {idx + 1}" if stem == current else f"{stem} · frame {idx + 1}"
+            item = QtWidgets.QListWidgetItem(f"{mark}  {where}")
+            item.setData(QtCore.Qt.UserRole, (stem, idx))
+            if todo:
+                item.setForeground(QtGui.QColor("#c62828"))
+            self.labelled_list.addItem(item)
+        self.labelled_list.blockSignals(False)
+        self._select_labelled_row()
+
+    def _select_labelled_row(self) -> None:
+        key = (self.video.path.stem, self.frame_idx) if self.video is not None else None
+        self.labelled_list.blockSignals(True)
+        self.labelled_list.clearSelection()
+        for i in range(self.labelled_list.count()):
+            if self.labelled_list.item(i).data(QtCore.Qt.UserRole) == key:
+                self.labelled_list.setCurrentRow(i)
+                break
+        self.labelled_list.blockSignals(False)
+
+    def _on_labelled_clicked(self, item: QtWidgets.QListWidgetItem) -> None:
+        self._goto_frame(*item.data(QtCore.Qt.UserRole))
+
+    def _goto_frame(self, stem: str, idx: int) -> None:
+        if self.video is None or self.video.path.stem != stem:
+            path = next((p for p in (resolve("recordings") / f"{stem}.mp4", resolve("data/frames") / f"{stem}.mp4")
+                         if p.exists()), None)
+            if path is None:
+                QtWidgets.QMessageBox.information(
+                    self, "Video not found", f"Couldn't find {stem}.mp4 in recordings/. Load it with 'Load video…'.")
+                return
+            annotating = self.chk_annot.isChecked()
+            self._autosave_annotation()
+            self.chk_annot.blockSignals(True)
+            self.chk_annot.setChecked(False)
+            self.chk_annot.blockSignals(False)
+            self.open_video(path)
+            if annotating:
+                self.chk_annot.setChecked(True)
+        self.playing = False
+        self.btn_play.setText("▶")
+        self.seek(idx)
+
+    def goto_labelled(self, direction: int) -> None:
+        frames = [(s, i) for s, i, _ in self._labelled_frames()]
+        if not frames:
+            return
+        here = (self.video.path.stem, self.frame_idx) if self.video is not None else ("", -1)
+        later = [f for f in frames if f > here] if direction > 0 else [f for f in frames if f < here]
+        target = (later[0] if direction > 0 else later[-1]) if later else (frames[0] if direction > 0 else frames[-1])
+        self._goto_frame(*target)
+
+    def delete_labels(self) -> None:
+        if self.mode != Mode.VIDEO or self.store.get(self._annot_file()) is None:
+            self.statusBar().showMessage("This frame has no saved labels", 3000)
+            return
+        if QtWidgets.QMessageBox.question(
+                self, "Delete labels", f"Remove frame {self.frame_idx + 1} from the dataset?\n"
+                                       "(Deletes its labels and saved image; the video is untouched.)"
+        ) != QtWidgets.QMessageBox.Yes:
+            return
+        self.store.remove(self._annot_file())
+        self.annot, self.annot_dirty = {}, False
+        self.statusBar().showMessage(f"Deleted labels for frame {self.frame_idx + 1}", 4000)
+        self._refresh_labelled_list()
+        self.seek(self.frame_idx)
+        self._update_annot_status()
 
     # -------------------------------------------------------------- render
     def _render(self, new_measurement: bool = False) -> None:
@@ -653,6 +823,8 @@ class MainWindow(QtWidgets.QMainWindow):
         color = OVERLAY_BGR.get(fb.state, (60, 60, 230)) if fb else (200, 200, 200)
 
         cam = self.geo_local.intrinsics.scaled_to(w, h)
+        if geo is not None and kp is not None and self.chk_fit.isChecked():
+            draw_model_fit(img, geo, cam, self.model, kp, 0.5 if annotating else self.min_conf)
         if geo is not None:
             draw_geometry(img, geo, cam, self.model, color)
         if kp is not None:
@@ -661,9 +833,11 @@ class MainWindow(QtWidgets.QMainWindow):
             cv2.circle(img, (w - 30, 30), 12, (0, 0, 255), -1, cv2.LINE_AA)
         self.video_label.show_bgr(img)
 
+        self._last_geo = geo
+        self._last_state = ("none" if fb is None or fb.state == BowState.NO_BOW
+                            else ("ok" if fb.state == BowState.OK else "bad"))
         if self.view3d.isVisible():
-            self.view3d.update_geometry(geo, "none" if fb is None or fb.state == BowState.NO_BOW
-                                        else ("ok" if fb.state == BowState.OK else "bad"))
+            self.view3d.update_geometry(geo, self._last_state)
         self._update_info(geo, w, h)
 
     def _set_banner(self, fb: Feedback) -> None:
@@ -687,6 +861,14 @@ class MainWindow(QtWidgets.QMainWindow):
             p = geo.pose
             lines += [f"violin     {np.linalg.norm(p.t) / 10:.1f} cm away",
                       f"pnp        {p.num_points} pts, {p.reproj_error_px:.1f} px rms"]
+            if p.dropped:
+                lines.append(f"outlier    ignored {p.dropped}")
+            va = p.view_angle_to_strings_deg
+            hint = "good" if va >= 75 else "turn so scroll & tailpiece are equally far from camera"
+            lines.append(f"view       {va:.0f}° to strings ({hint})")
+            if p.residuals:
+                worst = max(p.residuals, key=p.residuals.get)
+                lines.append(f"worst fit  {worst} {p.residuals[worst]:.1f} px")
             if geo.bow is not None:
                 b = geo.bow
                 lines += ["",

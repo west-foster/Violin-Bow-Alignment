@@ -33,7 +33,7 @@ import cv2
 import numpy as np
 import yaml
 from scipy.interpolate import CubicSpline
-from scipy.optimize import brentq
+from scipy.optimize import brentq, minimize_scalar
 
 from .keypoints import VIOLIN_KEYPOINTS, Keypoints2D
 
@@ -108,33 +108,87 @@ class ViolinModel:
         points = {k: np.asarray(vm[k], np.float64) for k in VIOLIN_KEYPOINTS}
         return cls(points, float(vm["string_length"]), float(cfg["bow"]["hair_length"]))
 
+    def parts(self) -> dict[str, np.ndarray]:
+        """Outline polylines that follow this model's (possibly fitted) keypoints."""
+        return violin_parts(self.string_length, self.points)
 
-def violin_wireframe(string_length: float = 325.0) -> list[np.ndarray]:
-    """Rough 4/4 violin outline (violin frame, mm) as a list of polylines, for drawing."""
-    # Body half-width vs. x (bridge at x=0, body from -161 to +195).
-    cx = np.array([-161, -155, -140, -110, -75, -45, -20, 0, 25, 55, 90, 130, 165, 188, 195], float)
-    cw = np.array([0, 55, 85, 102, 100, 85, 58, 55, 58, 75, 82, 78, 60, 35, 0], float)
-    xs = np.linspace(cx[0], cx[-1], 120)
-    hw = np.clip(CubicSpline(cx, cw)(xs), 0, None)
-    z_body = -38.0
-    body = np.vstack(
-        [np.c_[xs, hw, np.full_like(xs, z_body)], np.c_[xs[::-1], -hw[::-1], np.full_like(xs, z_body)]]
-    )
-    lines = [body]
+    def wireframe(self) -> list[np.ndarray]:
+        return list(self.parts().values())
+
+
+def violin_wireframe(string_length: float = 325.0, points: dict[str, np.ndarray] | None = None) -> list[np.ndarray]:
+    """Violin outline (violin frame, mm) as a list of polylines, for drawing."""
+    return list(violin_parts(string_length, points).values())
+
+
+def _smooth(pts: np.ndarray, n: int) -> np.ndarray:
+    """Interpolating cubic spline through 2D points (chord-length parameter)."""
+    t = np.r_[0, np.cumsum(np.linalg.norm(np.diff(pts, axis=0), axis=1))]
+    return CubicSpline(t, pts, axis=0)(np.linspace(0, t[-1], n))
+
+
+# Standard full-size body (bass half, neck -> tail), bridge at x = 0, in mm.
+# Bout widths follow published 4/4 measurements: upper ~166, C ~110,
+# lower ~207, body length ~356, stop (body top edge -> bridge) ~195. Corners
+# protrude from a deep C-bout. Only the corners move to the model's (fitted)
+# corner keypoints; the bouts keep their standard size.
+_UPPER = [(195, 0), (190, 30), (176, 56), (156, 74), (132, 82), (112, 83), (94, 81), (80, 78)]
+_C_BOUT = [(66, 68), (56, 61), (42, 57), (28, 55), (14, 56), (3, 60), (-6, 67), (-11, 75)]
+_LOWER = [(-22, 93), (-38, 100), (-62, 103.5), (-88, 103.5), (-115, 99), (-138, 86), (-152, 62), (-159, 32),
+          (-161, 0)]
+_STD_UPPER_CORNER = np.array([70.0, 75.0, -41.0])
+_STD_LOWER_CORNER = np.array([-15.0, 84.0, -49.0])
+
+
+def _body_outline(points: dict[str, np.ndarray] | None) -> np.ndarray:
+    """Closed body outline on the top-plate edge, passing exactly through the corner keypoints."""
+    up, lo = _STD_UPPER_CORNER.copy(), _STD_LOWER_CORNER.copy()
+    if points is not None and "corner_upper_bass" in points and "corner_lower_bass" in points:
+        up, lo = points["corner_upper_bass"].copy(), points["corner_lower_bass"].copy()
+        up[1], lo[1] = abs(up[1]), abs(lo[1])
+    upper = _smooth(np.array(_UPPER + [tuple(up[:2])], float), 40)
+    c_bout = _smooth(np.array([tuple(up[:2])] + _C_BOUT + [tuple(lo[:2])], float), 30)
+    lower = _smooth(np.array([tuple(lo[:2])] + _LOWER, float), 40)
+    half = np.vstack([upper[:-1], c_bout[:-1], lower])
+    # Plate-edge height: the string line is not parallel to the top, so the
+    # edge drops further below the strings toward the tail.
+    slope = (up[2] - lo[2]) / max(up[0] - lo[0], 1.0)
+    z = lo[2] + slope * (half[:, 0] - lo[0])
+    side = np.c_[half, z]
+    return np.vstack([side, (side * [1, -1, 1])[::-1][1:]])
+
+
+def violin_parts(string_length: float = 325.0, points: dict[str, np.ndarray] | None = None) -> dict[str, np.ndarray]:
+    """Named violin outline polylines (violin frame, mm). Closed shapes repeat their first point.
+
+    Pass the model's keypoints to make the body, tailpiece and scroll follow them.
+    """
+    parts: dict[str, np.ndarray] = {"body": _body_outline(points)}
+    nut = string_length
+    tp_top = points["tailpiece_top"] if points is not None and "tailpiece_top" in points else np.array([-55, 0, -15.0])
+    tp_end = points["tailpiece_end"] if points is not None and "tailpiece_end" in points else np.array([-155, 0, -36.0])
+    scroll = points["scroll"] if points is not None and "scroll" in points else np.array([nut + 105, 0, -15.0])
     # Fingerboard outline.
-    fb_end, nut = 55.0, string_length
-    fb = np.array(
-        [[fb_end, 21, -6], [nut, 12, -6], [nut, -12, -6], [fb_end, -21, -6], [fb_end, 21, -6]], float
-    )
-    lines.append(fb)
-    # Pegbox + scroll as a simple line.
-    lines.append(np.array([[nut, 0, -6], [nut + 70, 0, -20], [nut + 105, 0, -15]], float))
-    # Strings G, D, A, E.
-    for y_b, y_n, z_b in [(17, 8, -3), (5.7, 2.7, 0), (-5.7, -2.7, 0), (-17, -8, -3)]:
-        lines.append(np.array([[0, y_b, z_b], [nut, y_n, 0]], float))
+    fb_end = 55.0
+    parts["fingerboard"] = np.array(
+        [[fb_end, 21, -6], [nut, 12, -6], [nut, -12, -6], [fb_end, -21, -6], [fb_end, 21, -6]], float)
+    # Pegbox + scroll.
+    sx, sz = scroll[0], scroll[2]
+    mid = nut + 0.7 * (sx - nut)
+    parts["pegbox"] = np.array([[nut, 9, -8], [mid, 7, sz], [sx, 0, sz], [mid, -7, sz], [nut, -9, -8], [nut, 9, -8]],
+                               float)
+    # Tailpiece: wide top edge, narrow end.
+    parts["tailpiece"] = np.array([[tp_top[0], 21, tp_top[2]], [tp_end[0], 10, tp_end[2]],
+                                   [tp_end[0], -10, tp_end[2]], [tp_top[0], -21, tp_top[2]],
+                                   [tp_top[0], 21, tp_top[2]]], float)
     # Bridge.
-    lines.append(np.array([[0, 20, -35], [0, 17, -3], [0, 0, 0.5], [0, -17, -3], [0, -20, -35]], float))
-    return lines
+    bz = points["bridge_bass"][2] if points is not None and "bridge_bass" in points else -3.0
+    parts["bridge"] = np.array([[0, 20, -35], [0, 17, bz], [0, 0, 0.5], [0, -17, bz], [0, -20, -35]], float)
+    # Strings G, D, A, E run from the tailpiece over the bridge to the nut.
+    for name, y_b, y_n, z_b in [("G", 17, 8, bz), ("D", 5.7, 2.7, 0), ("A", -5.7, -2.7, 0), ("E", -17, -8, bz)]:
+        parts[f"string_{name}"] = np.array([[tp_top[0], y_b * 0.7, tp_top[2] + 1], [0, y_b, z_b], [nut, y_n, 0]],
+                                           float)
+    return parts
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +200,8 @@ class ViolinPose:
     t: np.ndarray  # (3,) camera-frame position of the bridge centre, mm
     reproj_error_px: float
     num_points: int
+    dropped: str | None = None  # keypoint rejected as an outlier, if any
+    residuals: dict[str, float] | None = None  # per-keypoint reprojection error, px
 
     def to_camera(self, pts: np.ndarray) -> np.ndarray:
         return (self.R @ np.atleast_2d(pts).T).T + self.t
@@ -162,6 +218,17 @@ class ViolinPose:
     def normal(self) -> np.ndarray:  # out of the top plate
         return self.R[:, 2]
 
+    @property
+    def view_angle_to_strings_deg(self) -> float:
+        """Angle between the camera's line of sight and the strings.
+
+        90 deg = strings lie flat across the image (best: the bow angle is then
+        directly visible). Small values = the camera looks along the strings,
+        where the single-camera depth ambiguity corrupts the bow angle.
+        """
+        v = -self.t / np.linalg.norm(self.t)
+        return float(np.degrees(np.arccos(min(1.0, abs(float(v @ self.string_axis))))))
+
 
 @dataclass
 class BowEstimate:
@@ -172,7 +239,7 @@ class BowEstimate:
     angle_deg: float  # bow vs. strings, 90 = straight
     tilt_deg: float  # rotation out of the string plane (string crossing)
     angle_2d_deg: float  # same angle measured naively in the image
-    method: str  # "length" or "plane"
+    method: str  # "length", or "plane" (fallback / bow end clipped by the frame)
     length_residual_mm: float
 
 
@@ -189,12 +256,17 @@ class FrameGeometry:
 # ---------------------------------------------------------------------------
 class GeometryEstimator:
     def __init__(self, model: ViolinModel, intrinsics: CameraIntrinsics, min_conf: float = 0.35,
-                 max_reproj_px: float = 25.0):
+                 max_reproj_px: float = 25.0, outlier_px: float = 4.0, bow_solver: str = "joint",
+                 sigma_length_mm: float = 25.0, sigma_tilt_deg: float = 12.0):
         self.model = model
         self.base_intrinsics = intrinsics
         self.intrinsics = intrinsics
         self.min_conf = min_conf
         self.max_reproj_px = max_reproj_px
+        self.outlier_px = outlier_px
+        self.bow_solver = bow_solver
+        self.sigma_length_mm = sigma_length_mm
+        self.sigma_tilt_deg = sigma_tilt_deg
         self._prev_pose: ViolinPose | None = None
 
     def reset(self) -> None:
@@ -205,6 +277,36 @@ class GeometryEstimator:
         names = [n for n in VIOLIN_KEYPOINTS if kp.visible(n, self.min_conf)]
         if len(names) < 4:
             return None
+        best, dropped_list = self._solve_pnp(kp, names), []
+        # A bad keypoint (mislabel, model error, occlusion) drags the whole pose.
+        # Greedy leave-one-out: drop the point whose removal helps most, if it
+        # clearly helps, keeping at least 5 points (up to 2 drops).
+        used = list(names)
+        while (best is not None and best[0] > self.outlier_px and len(used) > 5 and len(dropped_list) < 2):
+            trials = [(self._solve_pnp(kp, [n for n in used if n != d]), d) for d in used]
+            trials = [(t, d) for t, d in trials if t is not None]
+            if not trials:
+                break
+            alt, drop = min(trials, key=lambda td: td[0][0])
+            if alt[0] > 0.6 * best[0]:
+                break
+            best, used = alt, [n for n in used if n != drop]
+            dropped_list.append(drop)
+        dropped = ", ".join(dropped_list) or None
+        if best is None or best[0] > self.max_reproj_px:
+            return None
+        err, rvec, tvec, n_used = best
+        R, _ = cv2.Rodrigues(rvec)
+        # Residual of every labelled point (including a dropped one) under the final pose.
+        obj = np.array([self.model.points[n] for n in names], np.float64)
+        proj, _ = cv2.projectPoints(obj, rvec, tvec, self.intrinsics.K, self.intrinsics.dist)
+        res = np.linalg.norm(proj.reshape(-1, 2) - np.array([kp.get(n) for n in names]), axis=1)
+        pose = ViolinPose(R, tvec.ravel(), err, n_used, dropped, dict(zip(names, res.tolist())))
+        self._prev_pose = pose
+        return pose
+
+    def _solve_pnp(self, kp: Keypoints2D, names: list[str]):
+        """Returns (rms_px, rvec, tvec, n_points) or None."""
         obj = np.array([self.model.points[n] for n in names], np.float64)
         img = np.array([kp.get(n) for n in names], np.float64)
         K, dist = self.intrinsics.K, self.intrinsics.dist
@@ -228,13 +330,8 @@ class GeometryEstimator:
             if tvec[2, 0] <= 0:
                 continue
             if best is None or err < best[0] - 0.5:
-                best = (err, rvec, tvec)
-        if best is None or best[0] > self.max_reproj_px:
-            return None
-        R, _ = cv2.Rodrigues(best[1])
-        pose = ViolinPose(R, best[2].ravel(), best[0], len(names))
-        self._prev_pose = pose
-        return pose
+                best = (err, rvec, tvec, len(names))
+        return best
 
     # -- bow -----------------------------------------------------------------
     def estimate_bow(self, kp: Keypoints2D, pose: ViolinPose) -> BowEstimate | None:
@@ -260,73 +357,80 @@ class GeometryEstimator:
         rf2 = np.array([r_f @ e1, r_f @ e2])
         rt2 = np.array([r_t @ e1, r_t @ e2])
 
-        def endpoints(theta: float):
-            u = np.array([np.cos(theta), np.sin(theta)])
-            out = []
+        # A bow end touching the frame edge is probably cut off, so the visible
+        # frog-tip span is shorter than the real bow: the length constraint is
+        # invalid there and only the tilt prior is used.
+        m = 3.0
+        w, h = self.intrinsics.width, self.intrinsics.height
+        clipped = any(p[0] < m or p[1] < m or p[0] > w - 1 - m or p[1] > h - 1 - m for p in (frog_px, tip_px))
+
+        normal = pose.normal
+        L0 = self.model.bow_length
+
+        def geometry_at(theta: np.ndarray):
+            """Bow through C at in-plane direction theta -> (F, T, length, tilt_deg, valid)."""
+            theta = np.atleast_1d(theta)
+            ux, uy = np.cos(theta), np.sin(theta)
+            ends, valid = [], np.ones_like(theta, bool)
             for r in (rf2, rt2):
-                # Solve C + mu*u = s*r  ->  [r, -u] [s, mu]^T = C
-                A = np.column_stack([r, -u])
-                if abs(np.linalg.det(A)) < 1e-9:
-                    return None
-                s, _ = np.linalg.solve(A, c2)
-                if s <= 0:
-                    return None
-                out.append(s * r)
-            return out
+                # Solve C + mu*u = s*r with Cramer's rule.
+                det = -r[0] * uy + ux * r[1]
+                with np.errstate(divide="ignore", invalid="ignore"):
+                    sc = (-c2[0] * uy + ux * c2[1]) / det
+                valid &= (np.abs(det) > 1e-9) & (sc > 0)
+                p2 = sc[:, None] * r[None, :]
+                ends.append(p2[:, :1] * e1 + p2[:, 1:] * e2)
+            F, T = ends
+            length = np.linalg.norm(T - F, axis=1)
+            with np.errstate(invalid="ignore"):
+                d = (T - F) / length[:, None]
+                tilt = np.degrees(np.arcsin(np.clip(d @ normal, -1, 1)))
+            return F, T, length, tilt, valid & np.isfinite(length)
 
-        def length_err(theta: float) -> float:
-            ep = endpoints(theta)
-            return np.nan if ep is None else float(np.linalg.norm(ep[1] - ep[0]) - self.model.bow_length)
+        thetas = np.linspace(0, np.pi, 1441)[:-1]
+        F_all, T_all, L_all, tilt_all, ok = geometry_at(thetas)
+        if not ok.any():
+            return None
 
-        # Vectorised scan over line directions (Cramer's rule for both rays).
-        thetas = np.linspace(0, np.pi, 721)
-        ux, uy = np.cos(thetas), np.sin(thetas)
-        pts, valid = [], np.ones_like(thetas, bool)
-        for r in (rf2, rt2):
-            det = -r[0] * uy + ux * r[1]
-            with np.errstate(divide="ignore", invalid="ignore"):
-                s = (-c2[0] * uy + ux * c2[1]) / det
-            valid &= (np.abs(det) > 1e-9) & (s > 0)
-            pts.append(s[:, None] * r[None, :])
-        errs = np.where(valid, np.linalg.norm(pts[1] - pts[0], axis=1) - self.model.bow_length, np.nan)
-        solutions = []
-        for i in range(len(thetas) - 1):
-            a, b = errs[i], errs[i + 1]
-            if np.isfinite(a) and np.isfinite(b) and np.sign(a) != np.sign(b):
-                theta = brentq(length_err, thetas[i], thetas[i + 1], xtol=1e-7)
-                solutions.append(theta)
-
-        def to_3d(theta: float):
-            ep = endpoints(theta)
-            if ep is None:
-                return None
-            F = ep[0][0] * e1 + ep[0][1] * e2
-            T = ep[1][0] * e1 + ep[1][1] * e2
-            return F, T
-
-        candidates = []
-        for theta in solutions:
-            pts = to_3d(theta)
-            if pts is None:
-                continue
-            F, T = pts
-            d = (T - F) / np.linalg.norm(T - F)
-            candidates.append((abs(float(d @ pose.normal)), F, T, "length"))
-
-        if candidates:
-            _, F, T, method = min(candidates, key=lambda c: c[0])
+        if self.bow_solver == "switch":  # legacy: length roots, else assume tilt = 0
+            err = np.where(ok, L_all - L0, np.nan)
+            roots = [i for i in range(len(thetas) - 1)
+                     if np.isfinite(err[i]) and np.isfinite(err[i + 1]) and np.sign(err[i]) != np.sign(err[i + 1])]
+            if roots and not clipped:
+                i = min(roots, key=lambda i: abs(tilt_all[i]))
+                theta = brentq(lambda t: geometry_at(t)[2][0] - L0, thetas[i], thetas[i + 1], xtol=1e-9)
+                method = "length"
+            else:
+                i = int(np.nanargmin(np.where(ok, np.abs(tilt_all), np.nan)))
+                step = thetas[1] - thetas[0]
+                theta = float(minimize_scalar(lambda t: abs(geometry_at(t)[3][0]), method="bounded",
+                                              bounds=(thetas[i] - step, thetas[i] + step),
+                                              options={"xatol": 1e-9}).x)
+                method = "plane"
         else:
-            # Fallback: bow lies in the string plane -> direction = n x normal.
-            d = np.cross(n, pose.normal)
-            if np.linalg.norm(d) < 1e-6:
-                return None
-            d /= np.linalg.norm(d)
-            theta = float(np.arctan2(d @ e2, d @ e1)) % np.pi
-            pts = to_3d(theta)
-            if pts is None:
-                return None
-            F, T = pts
-            method = "plane"
+            # MAP estimate: bow length ~ L0 (frog/tip clicks are imprecise, the
+            # frog is often under the hand) AND tilt near the string plane
+            # (string crossings tilt the bow by up to ~+-20 deg). Both soft, so
+            # the answer varies smoothly instead of switching between methods.
+            def cost(L, tilt):
+                c = (tilt / self.sigma_tilt_deg) ** 2
+                if not clipped:
+                    c = c + ((L - L0) / self.sigma_length_mm) ** 2
+                return c
+
+            costs = np.where(ok, cost(L_all, tilt_all), np.inf)
+            i = int(np.argmin(costs))
+            step = thetas[1] - thetas[0]
+            res = minimize_scalar(lambda t: (lambda g: cost(g[2][0], g[3][0]) if g[4][0] else 1e9)(geometry_at(t)),
+                                  bounds=(thetas[i] - step, thetas[i] + step), method="bounded",
+                                  options={"xatol": 1e-6})
+            theta = float(res.x)
+            method = "joint (clipped)" if clipped else "joint"
+
+        F_, T_, _, _, valid = geometry_at(theta)
+        if not valid[0]:
+            return None
+        F, T = F_[0], T_[0]
 
         d = (T - F) / np.linalg.norm(T - F)
         angle = float(np.degrees(np.arccos(np.clip(d @ x_s, -1, 1))))

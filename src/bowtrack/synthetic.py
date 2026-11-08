@@ -63,6 +63,31 @@ def default_pose() -> tuple[np.ndarray, np.ndarray]:
     return rvec.ravel(), np.array([60.0, -60.0, 1050.0])
 
 
+# BGR fill / outline colours for the cartoon violin.
+_PART_STYLE = {
+    "body": ((40, 85, 150), (70, 130, 200)),
+    "tailpiece": ((25, 25, 25), (110, 110, 110)),
+    "fingerboard": ((25, 25, 25), (110, 110, 110)),
+    "pegbox": ((40, 85, 150), (70, 130, 200)),
+    "bridge": ((150, 200, 225), (150, 200, 225)),
+}
+
+
+def render_violin(img: np.ndarray, parts: dict[str, np.ndarray], cam: CameraIntrinsics, R: np.ndarray,
+                  t: np.ndarray) -> None:
+    """Draw a simple filled violin (back-to-front: body, tailpiece, fingerboard, bridge, strings)."""
+    for name in ("body", "tailpiece", "fingerboard", "pegbox", "bridge"):
+        px = cam.project((R @ parts[name].T).T + t).astype(np.int32)
+        fill, edge = _PART_STYLE[name]
+        if name != "bridge":
+            cv2.fillPoly(img, [px], fill, cv2.LINE_AA)
+        cv2.polylines(img, [px], False, edge, 2, cv2.LINE_AA)
+    for name, line in parts.items():
+        if name.startswith("string_"):
+            px = cam.project((R @ line.T).T + t).astype(np.int32)
+            cv2.polylines(img, [px], False, (200, 200, 200), 1, cv2.LINE_AA)
+
+
 class DemoSource:
     """Animated synthetic take: the bow sweeps through good and bad angles.
 
@@ -70,10 +95,8 @@ class DemoSource:
     """
 
     def __init__(self, model: ViolinModel, cam: CameraIntrinsics):
-        from .geometry import violin_wireframe
-
         self.model, self.cam = model, cam
-        self.wire = violin_wireframe(model.string_length)
+        self.parts = model.parts()
         self.base_r, self.base_t = default_pose()
 
     def frame(self, t: float, noise_px: float = 1.0) -> tuple[np.ndarray, SyntheticScene]:
@@ -84,10 +107,7 @@ class DemoSource:
         stroke = 250 + 200 * np.sin(1.6 * t)  # up / down bow
         scene = make_scene(self.model, self.cam, rvec, tvec, angle, tilt, 30.0, stroke, noise_px)
         img = np.full((self.cam.height, self.cam.width, 3), (58, 52, 48), np.uint8)
-        R, tv = scene.R, scene.t
-        for line in self.wire:
-            px = self.cam.project((R @ line.T).T + tv).astype(np.int32)
-            cv2.polylines(img, [px], False, (90, 150, 210), 2, cv2.LINE_AA)
+        render_violin(img, self.parts, self.cam, scene.R, scene.t)
         f, tp = self.cam.project(np.vstack([scene.frog, scene.tip])).astype(int)
         cv2.line(img, tuple(f), tuple(tp), (200, 200, 200), 3, cv2.LINE_AA)
         cv2.putText(img, "SYNTHETIC DEMO", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (120, 120, 120), 2, cv2.LINE_AA)

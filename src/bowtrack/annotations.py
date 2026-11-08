@@ -19,7 +19,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from .keypoints import KEYPOINT_NAMES
+from .keypoints import KEYPOINT_NAMES, LEGACY_RENAMES
 
 
 class AnnotationStore:
@@ -30,6 +30,10 @@ class AnnotationStore:
         if self.path.exists():
             data = json.loads(self.path.read_text())
             for entry in data.get("images", []):
+                kps = entry["keypoints"]
+                for old, new in LEGACY_RENAMES.items():
+                    if old in kps and new not in kps:
+                        kps[new] = kps.pop(old)
                 self.images[entry["file"]] = entry
 
     def __len__(self) -> int:
@@ -56,7 +60,9 @@ class AnnotationStore:
         return img_path
 
     def remove(self, file: str) -> None:
+        """Delete a frame's labels and its saved image."""
         if self.images.pop(file, None) is not None:
+            (self.root / file).unlink(missing_ok=True)
             self.save()
 
     def save(self) -> None:
@@ -65,6 +71,14 @@ class AnnotationStore:
         tmp = self.path.with_suffix(".tmp")
         tmp.write_text(json.dumps(data, indent=1))
         tmp.replace(self.path)
+
+    @staticmethod
+    def missing(keypoints: dict) -> list[str]:
+        """Keypoints never labelled on this frame (added after it was saved).
+
+        A key with value None means "marked not visible", which is a real label.
+        """
+        return [n for n in KEYPOINT_NAMES if n not in keypoints]
 
     def entries(self) -> list[dict]:
         return list(self.images.values())

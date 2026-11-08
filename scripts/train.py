@@ -19,6 +19,7 @@ from bowtrack.dataset import KeypointDataset, split_entries
 from bowtrack.detector import pick_device, save_checkpoint
 from bowtrack.keypoints import KEYPOINT_NAMES
 from bowtrack.model import HeatmapPoseNet, decode_heatmaps
+from bowtrack.validation import summarize, validate_dataset
 
 
 @torch.no_grad()
@@ -56,6 +57,7 @@ def main():
     ap.add_argument("--out", default=None)
     ap.add_argument("--workers", type=int, default=4)
     ap.add_argument("--data", default="data", help="folder containing annotations.json")
+    ap.add_argument("--skip-pose-check", action="store_true", help="skip the offline outline/pose check")
     args = ap.parse_args()
 
     input_hw = (mc["input_height"], mc["input_width"])
@@ -63,6 +65,19 @@ def main():
     entries = store.entries()
     if len(entries) < 20:
         raise SystemExit(f"Only {len(entries)} labelled frames in data/annotations.json - label more in the GUI.")
+    # Offline sanity check of the labels + violin model before spending GPU time.
+    fit_file = resolve("configs/violin_fit.yaml")
+    if not fit_file.exists():
+        print("note: no configs/violin_fit.yaml - run scripts/fit_violin_model.py to fit your violin's dimensions")
+    elif store.path.stat().st_mtime > fit_file.stat().st_mtime:
+        print("note: labels changed since the violin model was fitted - consider re-running fit_violin_model.py")
+    if not args.skip_pose_check:
+        results = validate_dataset(store, cfg)
+        print("pose check:", summarize(results))
+        for f, _, reason in results:
+            if reason:
+                print(f"  check {f}: {reason}")
+
     train_e, val_e = split_entries(entries)
     print(f"{len(train_e)} train / {len(val_e)} val frames, keypoints: {KEYPOINT_NAMES}")
 

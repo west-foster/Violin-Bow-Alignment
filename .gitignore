@@ -9,7 +9,10 @@ __pycache__/
 recordings/*
 !recordings/.gitkeep
 data/frames/*
+data/annotations.json
 !data/frames/.gitkeep
 checkpoints/*
 !checkpoints/.gitkeep
 configs/camera_calibration.yaml
+data/validation/
+configs/violin_fit.yaml

@@ -60,3 +60,26 @@ def draw_geometry(img: np.ndarray, geo: FrameGeometry, cam: CameraIntrinsics, mo
         org = (int(c[0]) + int(14 * s), int(c[1]) + int(30 * s))
         cv2.putText(img, label, org, cv2.FONT_HERSHEY_SIMPLEX, 0.8 * s, (0, 0, 0), int(5 * s), cv2.LINE_AA)
         cv2.putText(img, label, org, cv2.FONT_HERSHEY_SIMPLEX, 0.8 * s, color, max(1, int(2 * s)), cv2.LINE_AA)
+
+
+def draw_model_fit(img: np.ndarray, geo: FrameGeometry, cam: CameraIntrinsics, model: ViolinModel,
+                   kp: Keypoints2D, min_conf: float) -> None:
+    """Project the fitted 3D violin back onto the frame.
+
+    If the pose is right, the thin outline sits on the real violin. Each labelled
+    violin point gets a line to where the fitted model puts it (its residual).
+    """
+    if geo.pose is None:
+        return
+    s = max(1.0, img.shape[1] / 1280)
+    layer = img.copy()
+    for line in model.wireframe():
+        px = cam.project(geo.pose.to_camera(line)).astype(np.int32)
+        cv2.polylines(layer, [px], False, (255, 230, 120), max(1, int(s)), cv2.LINE_AA)
+    cv2.addWeighted(layer, 0.6, img, 0.4, 0, dst=img)
+    for name, p3 in model.points.items():
+        if not kp.visible(name, min_conf):
+            continue
+        q = cam.project(geo.pose.to_camera(p3))[0]
+        cv2.line(img, _pt(kp.get(name)), _pt(q), (255, 255, 255), 1, cv2.LINE_AA)
+        cv2.circle(img, _pt(q), int(5 * s), (255, 230, 120), max(1, int(s)), cv2.LINE_AA)
