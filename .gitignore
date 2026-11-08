@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+.DS_Store
+
+# Large / personal artifacts
+recordings/*
+!recordings/.gitkeep
+data/frames/*
+!data/frames/.gitkeep
+checkpoints/*
+!checkpoints/.gitkeep
+configs/camera_calibration.yaml

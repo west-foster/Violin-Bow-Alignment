@@ -1,0 +1,46 @@
+# bowtrack default configuration.
+# All lengths are in millimetres. Measure your own violin/bow and override these
+# for best 3D accuracy (a few mm of error here only shifts the angle slightly).
+
+camera:
+  index: 0               # OpenCV camera index (0 = built-in webcam)
+  width: 1280
+  height: 720
+  fps: 30
+  # Used only if no calibration file exists. MacBook webcams are roughly 65-75 deg.
+  horizontal_fov_deg: 70.0
+  # Written by scripts/calibrate_camera.py (checkerboard calibration).
+  calibration_file: configs/camera_calibration.yaml
+
+# Violin coordinate frame (right-handed):
+#   origin = centre of the bridge at string height
+#   +x     = along the strings toward the scroll
+#   +y     = across the strings toward the bass (G) side
+#   +z     = out of the top plate (toward the player's face)
+# Approximate full-size (4/4) violin. Keypoints the model can see are matched
+# against these with solvePnP to get the violin's 6-DoF pose.
+violin_model:
+  scroll:        [430.0,   0.0, -15.0]
+  nut:           [325.0,   0.0,   0.0]
+  bridge_bass:   [  0.0,  17.0,  -3.0]
+  bridge_treble: [  0.0, -17.0,  -3.0]
+  chinrest:      [-135.0, 35.0, -25.0]
+  string_length: 325.0   # nut -> bridge, defines the string axis
+
+bow:
+  # Distance between the frog and tip keypoints (where the hair meets the
+  # frog ferrule and the tip). ~650 mm for a full-size bow.
+  hair_length: 650.0
+
+feedback:
+  target_angle_deg: 90.0
+  tolerance_deg: 5.0
+  smoothing_window: 5     # median filter over this many frames
+  min_confidence: 0.35    # keypoint heatmap peak needed to count as visible
+
+model:
+  backbone: resnet50      # teacher; students: resnet18, mobilenet_v3_large
+  input_height: 256
+  input_width: 448
+  heatmap_sigma: 2.0
+  checkpoint: checkpoints/teacher_resnet50.pt
