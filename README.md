@@ -6,6 +6,11 @@ single camera, and measures the angle between the bow and the strings. A banner
 turns **green** when the bow is straight (90° ± tolerance), **red** when it drifts
 (and says which way), and **black** when no bow is visible.
 
+![Demo: the trained model on a real take](docs/images/demo.gif)
+
+*The trained keypoint model on a real recorded take: 3D reconstruction on the left, the
+app on the right with the bow banner turning red and green as the bow angle changes.*
+
 A second bar under the banner checks the **position**: whether the violin is close enough
 and turned so the bow angle can be measured accurately, and if not, what to change.
 
