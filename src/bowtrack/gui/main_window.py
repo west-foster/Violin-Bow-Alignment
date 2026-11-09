@@ -7,6 +7,8 @@ annotation mode turns the same window into a labelling tool for training data.
 
 from __future__ import annotations
 
+import html
+
 import time
 from enum import Enum, auto
 from pathlib import Path
@@ -406,7 +408,9 @@ class MainWindow(QtWidgets.QMainWindow):
         scroll.setWidget(right_w)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
-        scroll.setFixedWidth(350)
+        # Wide enough for the panel's contents plus the vertical scrollbar (so nothing is clipped on the right).
+        bar = scroll.style().pixelMetric(QtWidgets.QStyle.PM_ScrollBarExtent)
+        scroll.setFixedWidth(max(372, right_w.minimumSizeHint().width() + bar + 2 * scroll.frameWidth()))
 
         root = QtWidgets.QHBoxLayout()
         root.addLayout(left, 1)
@@ -1295,7 +1299,8 @@ class MainWindow(QtWidgets.QMainWindow):
                 lines.append(geo.message or "no bow")
         tol = self.feedback.tolerance
         lines += ["", f"target     {self.feedback.target:.0f}° ± {tol:.0f}°"]
-        self.info.setText("<pre>" + "\n".join(lines) + "</pre>")
+        # pre-wrap, not <pre>: a long line must wrap rather than widen the side panel (which clips its buttons).
+        self.info.setText("<div style='white-space:pre-wrap'>" + html.escape("\n".join(lines)) + "</div>")
 
     # ------------------------------------------------------------- cleanup
     def closeEvent(self, ev: QtGui.QCloseEvent) -> None:

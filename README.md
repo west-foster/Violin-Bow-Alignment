@@ -6,17 +6,26 @@ single camera, and measures the angle between the bow and the strings. A banner
 turns **green** when the bow is straight (90° ± tolerance), **red** when it drifts
 (and says which way), and **black** when no bow is visible.
 
-![GUI](docs/images/gui_demo.png)
+A second bar under the banner checks the **position**: whether the violin is close enough
+and turned so the bow angle can be measured accurately, and if not, what to change.
 
-| 3D view | Labelling tool |
+![Straight bow, good position](docs/images/gui_demo.png)
+
+| Bow angled, violin too far away | Bow angled, player turned away |
+|---|---|
+| ![too far](docs/images/gui_too_far.png) | ![turn](docs/images/gui_turn.png) |
+
+| 3D view | Labelling: checking a model-labelled frame |
 |---|---|
 | ![3D](docs/images/view3d.png) | ![labelling](docs/images/labelling.png) |
+
+*Screenshots use the built-in synthetic demo (no camera needed).*
 
 ## Why 3D?
 
 The webcam sees the violin obliquely, so the angle *in the image* is badly
-distorted. In the screenshot above the bow is 101.8° to the strings in 3D, but
-only 72° in the image. bowtrack measures the true 3D angle.
+distorted: in the synthetic demo the angle in the image is often about 30° away
+from the true angle between bow and strings. bowtrack measures the true 3D angle.
 
 ## Pipeline
 
