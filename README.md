@@ -26,9 +26,12 @@ flowchart LR
     B --> C[solvePnP vs. violin model<br/>-> violin 6-DoF pose]
     B --> D[Bow plane ∩ string axis<br/>-> contact point]
     C --> D
-    D --> E[Bow-length constraint<br/>-> 3D bow direction]
+    M[Microphone<br/>level] --> S[Playing?]
+    D --> E[Bow in the bowing plane<br/>-> 3D bow direction]
     E --> F[angle = acos d·x_strings<br/>median smoothing]
+    S --> F
     F --> G[Banner: green / red / black]
+    C --> P[Position advisor<br/>turn / step back / raise camera]
     F -.-> H[future: servo haptics]
 ```
 
@@ -52,13 +55,21 @@ the confidence. A hidden keypoint is trained to an all-zero map.
 2. *Contact point*: the camera centre and the 2D bow line span a plane. Its
    intersection with the 3D string axis is where the bow crosses the strings,
    which also gives the **sounding-point distance from the bridge** in mm.
-3. *Bow direction*: inside that plane, the frog and tip must lie on their camera
-   rays and be exactly one bow-hair length apart. This is solved by a vectorised
-   scan plus Brent root-finding. Of the two mirror solutions, the one lying
-   closest to the string plane wins. If noise leaves no solution, the bow is
-   assumed to lie in the string plane.
-   A bow end touching the frame border is treated as cut off, and the
-   plane assumption is used instead of the length constraint.
+3. *Bow direction*. A sounding bow rests on a string, so it lies
+   in that string's *bowing plane*. The bridge is arched, so each string has
+   its own tilt (G +20°, D +7°, A −7°, E −20° about the string axis,
+   `strings.tilt_deg`). Bowing plane ∩ interpretation plane gives the bow
+   direction in closed form. This needs only the bow's 2D line (any
+   visible piece of stick or hair), not the bow length or either end, so the
+   bow can run out of frame. With 2 px label noise the median error is under 0.5°.
+
+   Which string is played is **not** detected. The **String** box defaults to
+   *Any*: the middle (D/A) plane is assumed, or, when both bow ends are in
+   view, the bow length picks the tilt. How much the string could matter depends
+   only on the viewpoint, and the position bar (below) keeps the player where it
+   is under 5°. From a good viewpoint the four planes give almost the same
+   angle. Picking a string by hand (open-string or one-string practice) makes it
+   exact from any viewpoint.
    Keypoints that don't fit the model (reprojection > 4 px) are found by greedy
    leave-one-out and ignored: up to 2, always keeping at least 5 points.
 4. *Angle*: `acos(d_bow · x_strings)`. Tilting the bow to cross strings is a
@@ -96,23 +107,36 @@ On macOS, give your terminal camera access the first time
 1. **Record**: `Start camera` → `● Record`. Play a few takes with good *and*
    bad bow angles, different lighting, and the whole bow in view. When you stop,
    the take opens for frame-by-frame review.
-2. **Label**: tick *Annotate mode* (`A`). Click the 7 points in order (the list
-   auto-advances), `N` = not visible, right-click removes a point, and `S` saves.
-   The panel shows a diagram of where the selected point goes. Labels go to
-   `data/annotations.json` and frames to `data/frames/`. The *Labelled frames* list
-   (`[` / `]` to step through it) flags frames that still need fixing, and
-   *Delete labels* removes a frame from the dataset. While you click, the
-   fitted 3D violin is drawn over the frame, with a line from each click to the
-   model's prediction, and the 3D window updates, so a bad click or wrong pose
-   is obvious right away. Spread
-   ~150-300 labelled frames across takes, taking every 5-10th frame. Saved
-   labels already drive the full 3D pipeline, so the geometry can be checked on
-   your own footage before any training.
+2. **Label**: tick *Annotate mode* (`A`). Each new frame starts on the first
+   point it still needs (the scroll on a fresh frame). Click the points in order
+   (the list auto-advances), drag any placed point to move it, `N` = not visible,
+   right-click removes a point. The panel shows a diagram of where the selected
+   point goes. Frames you label by hand count as **approved** and are saved to
+   `data/annotations.json` (frames go to `data/frames/`). Edits are saved
+   when you leave the frame, or with `S`. While you click, the fitted 3D violin
+   is drawn over the frame, with a line from each click to the model's
+   prediction, and the 3D window updates, so a bad click or wrong pose is
+   obvious right away.
 3. **Train**: `python scripts/train.py` (ResNet-50 by default, on MPS/CUDA).
-   It splits train/val **by take** to avoid leakage between near-identical
-   frames, then reports pixel error, PCK, and visibility precision/recall.
-4. **Apply**: tick *Apply model*. Inference runs on a worker thread. Once a
-   model exists, it pre-fills labels on new frames, so labelling speeds up.
+   Only **approved** frames are used. With 6+ takes, whole takes are held out
+   for validation. With fewer, the last 15% of each take's frames are. It
+   reports pixel error, PCK, and visibility precision/recall.
+4. **Let the model label, then check**: load a take and press *Label frames
+   with model* (every N-th frame; frames already labelled are skipped). Its
+   labels go to `data/model_labels.json` and the **To check** tab. Points under
+   60% confidence, frames with no pose, and frames whose fit is off by more than
+   4 px are flagged in orange. Click a frame, drag any wrong point into place,
+   and press **✓ Approve** (`Enter`). The frame moves to *Approved* (training
+   data) and the next frame to check opens. `[` / `]` step through the tab
+   shown, and *Delete labels* drops a frame from either group. Retrain, repeat.
+   Ticking *Apply model* also runs inference live and pre-fills new frames
+   (those also stay "to check" until approved).
+   On a recorded take, *Apply model* runs the model up to 90 frames ahead of the
+   playhead, so playback runs at the take's frame rate with every frame's points
+   ready, and stepping back is instant. Start the app with the model on with
+   `python -m bowtrack.gui.app --video recordings/take_….mp4 --model --no-sound`.
+   The **Tolerance ±** box in the toolbar sets the green band live (default
+   `feedback.tolerance_deg`).
 5. **Calibrate (optional, recommended)**:
    `python scripts/calibrate_camera.py --cols 9 --rows 6 --square-mm 25`.
    Without calibration, intrinsics are approximated from a 70° FOV.
@@ -147,6 +171,48 @@ python scripts/validate_pose.py --compare
   *orientation-matched* image edges, so strings and clothing crossing the
   outline don't count. It is independent evidence, because the fit never sees
   image edges. `train.py` runs it before training and lists suspicious frames.
+
+## Sound: is the bow on a string?
+
+`src/bowtrack/audio.py` (pure numpy, tested) measures the level against a
+tracked noise floor. While a note sounds, the bow must be on a string. During
+silence the banner goes black instead of guessing. The pitch is not used.
+Live audio comes from
+the microphone through Qt Multimedia (`gui/mic.py`). While recording, it is
+saved as `recordings/take_….wav` next to the video, so scrubbing and labelling
+a take later use the same sound.
+
+On macOS, allow microphone access for Terminal (the first start asks), the same
+as for the camera.
+
+## Position indicator: turn, step back, raise the camera
+
+The bar under the bow banner (`src/bowtrack/positioning.py`) tells you how to
+stand so the angle can be measured.
+
+The key number is how much the bow angle would change if the wrong string's
+bowing plane were assumed. From a good viewpoint the four planes give almost the
+same angle. From a bad one they differ by 15° or more. For the current pose,
+and for the player turning by ±60° (plus the camera raised by up to 40°), the
+advisor computes that error for bows at 85/90/95°. It then suggests the smallest
+change that brings the error under 5°. The limit is 10° when a single string
+is chosen in the **String** box.
+
+Messages, in priority order:
+
+- **Step back**, or **move left/right**, when the violin is cut off by the frame.
+- **Turn your body ~N° to your left/right.** Directions are from the player's
+  point of view; the webcam image is not mirrored.
+- **Raise the camera** to look down onto the top plate, when turning isn't enough.
+  If the top plate is seen nearly edge-on, every string plane looks the same.
+- **Step closer**, when the violin is too small (below 0.4 px per mm, about 2.3 m from a 720p webcam).
+
+On the author's labelled frames, the first take (view 50–63°) got
+"turn ~20–35° to your left" (±13–23° → ±4–5°). The second take got small
+corrections or "position good".
+
+The bow no longer has to stay fully in frame. Only the stretch near the strings
+needs to be visible.
 
 ## Camera placement matters more than anything else
 
@@ -193,11 +259,13 @@ src/bowtrack/
   detector.py     checkpoint loading + inference wrapper (Task 3)
   geometry.py     intrinsics, PnP, bow 3D solve, angle (Task 4)
   feedback.py     smoothed green/red/black state + FeedbackSink hook (Task 5)
+  audio.py        sound level -> is a note sounding? (.wav I/O)
+  positioning.py  "how to stand" advisor: turn / step back / raise camera
   overlay.py      OpenCV drawing
-  annotations.py  JSON label store
+  annotations.py  JSON label stores (approved / model labels to check)
   dataset.py      augmented training dataset
   synthetic.py    ground-truth scenes for tests and demo mode
-  gui/            PySide6 main window + pyqtgraph 3D window (Tasks 2, 4, 5)
+  gui/            PySide6 main window, pyqtgraph 3D window, Qt microphone (Tasks 2, 4, 5)
   model_fit.py    bundle adjustment of the violin model + focal length
   validation.py   offline outline-vs-edge pose check
 scripts/          train.py, calibrate_camera.py, fit_violin_model.py, validate_pose.py

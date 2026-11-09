@@ -14,6 +14,7 @@ from typing import Protocol
 
 import numpy as np
 
+from .audio import SoundState
 from .geometry import FrameGeometry
 
 
@@ -50,7 +51,12 @@ class BowFeedback:
         self._angles.clear()
         self._missing = 0
 
-    def update(self, geo: FrameGeometry | None) -> Feedback:
+    def update(self, geo: FrameGeometry | None, sound: SoundState | None = None) -> Feedback:
+        """`sound`: microphone / .wav state, or None if there is none (then every bow counts as playing)."""
+        silent = sound is not None and not sound.sounding
+        if silent:
+            geo = FrameGeometry(geo.pose if geo else None, None, geo.bow_visible if geo else False,
+                                "Not playing (no sound)")
         if geo is not None and geo.bow is not None:
             self._angles.append(geo.bow.angle_deg)
             self._missing = 0
@@ -59,6 +65,8 @@ class BowFeedback:
             if self._missing > self._max_missing:
                 self._angles.clear()
 
+        if silent:
+            self._angles.clear()  # a new note starts a fresh measurement
         if not self._angles:
             reason = geo.message if geo is not None and geo.message else "no bow detected"
             fb = Feedback(BowState.NO_BOW, None, None, reason.capitalize())

@@ -9,6 +9,13 @@ data/annotations.json
   ]
 }
 A null keypoint means "not visible in this frame" (trained as absent).
+
+Two stores share data/frames/:
+  * annotations.json  -- APPROVED labels (clicked or checked by hand). The
+    only file training, the violin-model fit and the pose check read.
+  * model_labels.json -- labels proposed by the model, waiting to be checked
+    in the GUI. Entries also hold the model's per-point confidence ("conf").
+    Approving a frame moves it to annotations.json.
 """
 
 from __future__ import annotations
@@ -22,10 +29,14 @@ import numpy as np
 from .keypoints import KEYPOINT_NAMES, LEGACY_RENAMES
 
 
+APPROVED_FILE = "annotations.json"
+MODEL_FILE = "model_labels.json"
+
+
 class AnnotationStore:
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, filename: str = APPROVED_FILE):
         self.root = Path(root)
-        self.path = self.root / "annotations.json"
+        self.path = self.root / filename
         self.images: dict[str, dict] = {}
         if self.path.exists():
             data = json.loads(self.path.read_text())
@@ -43,8 +54,12 @@ class AnnotationStore:
         entry = self.images.get(file)
         return None if entry is None else entry["keypoints"]
 
-    def put(self, file: str, image: np.ndarray, keypoints: dict[str, list[float] | None]) -> Path:
-        """Save the frame image (if new) and its labels, then flush to disk."""
+    def entry(self, file: str) -> dict | None:
+        return self.images.get(file)
+
+    def put(self, file: str, image: np.ndarray, keypoints: dict[str, list[float] | None],
+            flush: bool = True, **extra) -> Path:
+        """Save the frame image (if new) and its labels (+ extra fields, e.g. conf), then flush to disk."""
         img_path = self.root / file
         img_path.parent.mkdir(parents=True, exist_ok=True)
         if not img_path.exists():
@@ -55,14 +70,17 @@ class AnnotationStore:
             "width": w,
             "height": h,
             "keypoints": {n: keypoints.get(n) for n in KEYPOINT_NAMES},
+            **extra,
         }
-        self.save()
+        if flush:
+            self.save()
         return img_path
 
-    def remove(self, file: str) -> None:
-        """Delete a frame's labels and its saved image."""
+    def remove(self, file: str, delete_image: bool = True) -> None:
+        """Delete a frame's labels (and, unless it moves to another store, its saved image)."""
         if self.images.pop(file, None) is not None:
-            (self.root / file).unlink(missing_ok=True)
+            if delete_image:
+                (self.root / file).unlink(missing_ok=True)
             self.save()
 
     def save(self) -> None:

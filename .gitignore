@@ -16,3 +16,5 @@ checkpoints/*
 configs/camera_calibration.yaml
 data/validation/
 configs/violin_fit.yaml
+data/model_labels.json
+logs/

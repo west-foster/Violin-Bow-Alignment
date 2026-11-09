@@ -103,8 +103,49 @@ def test_clipped_bow_end_uses_plane_fallback():
     cam = CameraIntrinsics(CAM.K, CAM.dist, 1280, height)
     scene.keypoints.xy[ti] = cut
     geo = GeometryEstimator(MODEL, cam)(scene.keypoints, (1280, height))
-    assert geo.bow.method == "joint (clipped)"
+    assert geo.bow.method == "contact (string unknown)"
     assert geo.bow.angle_deg == pytest.approx(90.0, abs=1.0)
     # Without clipping handling, the shortened span would distort the length solve.
     geo_full = GeometryEstimator(MODEL, CAM)(scene.keypoints, (1280, 720))
     assert geo_full.bow.method == "joint"
+
+
+@pytest.mark.parametrize("string", ["G", "D", "A", "E"])
+@pytest.mark.parametrize("angle", [75.0, 90.0, 105.0])
+def test_contact_solver_needs_only_a_short_bow_segment(string, angle):
+    """Known string: exact angle from any short visible stretch of the bow (no length, no ends)."""
+    rvec, tvec = default_pose()
+    tilt = -MODEL.string_tilt_deg[string]  # synthetic tilt convention is the opposite sign
+    scene = make_scene(MODEL, CAM, rvec, tvec, angle_deg=angle, tilt_deg=tilt, contact_mm=30.0)
+    fi, ti = KP_INDEX["bow_frog"], KP_INDEX["bow_tip"]
+    f, t = scene.keypoints.xy[fi].copy(), scene.keypoints.xy[ti].copy()
+    # Only ~15% of the bow, around the contact point, is "seen".
+    scene.keypoints.xy[fi], scene.keypoints.xy[ti] = f + 0.30 * (t - f), f + 0.45 * (t - f)
+    geo = GeometryEstimator(MODEL, CAM)(scene.keypoints, (1280, 720), string=string)
+    assert geo.bow.method == f"contact {string}"
+    assert geo.bow.angle_deg == pytest.approx(angle, abs=0.05)
+    expected_tilt = np.degrees(np.arcsin(np.sin(np.radians(angle)) * np.sin(np.radians(tilt))))
+    assert geo.bow.tilt_deg == pytest.approx(expected_tilt, abs=0.05)
+    assert geo.bow.contact_from_bridge_mm == pytest.approx(30.0, abs=0.5)
+
+
+def test_contact_solver_robust_to_bow_label_noise():
+    rng = np.random.default_rng(5)
+    rvec, tvec = default_pose()
+    errs = []
+    for _ in range(100):
+        s = rng.choice(["G", "D", "A", "E"])
+        ang = rng.uniform(80, 100)
+        scene = make_scene(MODEL, CAM, rvec, tvec, angle_deg=ang, tilt_deg=-MODEL.string_tilt_deg[s])
+        scene.keypoints.xy[KP_INDEX["bow_frog"]] += rng.normal(0, 2.0, 2).astype(np.float32)
+        scene.keypoints.xy[KP_INDEX["bow_tip"]] += rng.normal(0, 2.0, 2).astype(np.float32)
+        geo = GeometryEstimator(MODEL, CAM)(scene.keypoints, (1280, 720), string=s)
+        errs.append(abs(geo.bow.angle_deg - ang))
+    assert np.median(errs) < 0.5 and max(errs) < 2.0
+
+
+def test_bow_off_the_strings_is_not_measured():
+    rvec, tvec = default_pose()
+    scene = make_scene(MODEL, CAM, rvec, tvec, contact_mm=250.0)  # over the fingerboard, near the nut
+    geo = GeometryEstimator(MODEL, CAM)(scene.keypoints, (1280, 720))
+    assert geo.bow is None and "not on the strings" in geo.message

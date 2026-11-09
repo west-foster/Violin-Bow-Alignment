@@ -13,7 +13,7 @@ import numpy as np
 import torch
 from torch.utils.data import DataLoader
 
-from bowtrack.annotations import AnnotationStore
+from bowtrack.annotations import MODEL_FILE, AnnotationStore
 from bowtrack.config import load_config, resolve
 from bowtrack.dataset import KeypointDataset, split_entries
 from bowtrack.detector import pick_device, save_checkpoint
@@ -61,8 +61,11 @@ def main():
     args = ap.parse_args()
 
     input_hw = (mc["input_height"], mc["input_width"])
-    store = AnnotationStore(resolve(args.data))
+    store = AnnotationStore(resolve(args.data))  # approved labels only
     entries = store.entries()
+    n_check = len(AnnotationStore(resolve(args.data), MODEL_FILE))
+    if n_check:
+        print(f"note: {n_check} model-labelled frames are waiting in 'To check' (not used until approved)")
     if len(entries) < 20:
         raise SystemExit(f"Only {len(entries)} labelled frames in data/annotations.json - label more in the GUI.")
     # Offline sanity check of the labels + violin model before spending GPU time.

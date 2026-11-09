@@ -12,11 +12,19 @@ Pipeline (single monocular camera, no depth sensor):
    bridge (the "sounding point").
 
 3. Bow direction. Inside that plane the bow is a line through the contact
-   point; its two ends lie on the camera rays through the frog and tip pixels.
-   The known frog-tip distance pins down the remaining degree of freedom (two
-   mirror solutions are possible; we keep the one closest to lying on the
-   strings, i.e. the smallest tilt). If the length equation has no solution
-   (noisy keypoints), we fall back to assuming the bow lies in the string plane.
+   point: one unknown left (how far it leans toward / away from the camera).
+   * "contact" (default when the played string is known, i.e. chosen in the
+     GUI): a bow sounding a string rests on it, so it lies in
+     that string's bowing plane (the plane tangent to the arched bridge at
+     that string). Plane ∩ interpretation plane = the bow direction, in closed
+     form. Needs only the bow's 2D line -- any visible stretch of stick/hair,
+     no bow length, both ends may be out of frame.
+   * "joint" (string unknown, both bow ends visible): MAP estimate using the
+     known frog-tip length plus a prior that the tilt is near the string plane.
+   * string unknown and an end cut off: assume the middle (D/A) plane; the
+     error this can cause is reported as `string_spread_deg`. The position
+     indicator (positioning.py) keeps the player at a viewpoint where this
+     error is small, so the string doesn't need to be known.
 
 4. Angle. angle = acos(d_bow . x_strings). 90 deg is a perfectly straight
    bow. < 90 means the tip points toward the scroll, > 90 toward the bridge.
@@ -26,7 +34,7 @@ Pipeline (single monocular camera, no depth sensor):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import cv2
@@ -36,6 +44,12 @@ from scipy.interpolate import CubicSpline
 from scipy.optimize import brentq, minimize_scalar
 
 from .keypoints import VIOLIN_KEYPOINTS, Keypoints2D
+
+STRINGS = ["G", "D", "A", "E"]
+# Bowing-plane tilt (deg, + toward the bass side). Adjacent double-stop planes
+# on a standard bridge arch (radius ~42 mm, 11.3 mm spacing) are ~0 and ~+-15
+# deg; a single string is bowed between its two neighbouring double-stop planes.
+DEFAULT_STRING_TILT = {"G": 20.0, "D": 7.0, "A": -7.0, "E": -20.0}
 
 
 # ---------------------------------------------------------------------------
@@ -101,12 +115,25 @@ class ViolinModel:
     points: dict[str, np.ndarray]
     string_length: float
     bow_length: float
+    # Bowing-plane tilt per string: rotation of the plane's normal about the
+    # string axis, + toward the bass side (deg). The bridge is arched, so each
+    # string is bowed in a differently tilted plane.
+    string_tilt_deg: dict[str, float] = field(default_factory=lambda: dict(DEFAULT_STRING_TILT))
+    playing_region_mm: tuple[float, float] = (-15.0, 150.0)  # contact must be this far from the bridge
 
     @classmethod
     def from_config(cls, cfg: dict) -> "ViolinModel":
         vm = cfg["violin_model"]
         points = {k: np.asarray(vm[k], np.float64) for k in VIOLIN_KEYPOINTS}
-        return cls(points, float(vm["string_length"]), float(cfg["bow"]["hair_length"]))
+        st = cfg.get("strings", {})
+        tilt = {k: float(v) for k, v in (st.get("tilt_deg") or DEFAULT_STRING_TILT).items()}
+        region = tuple(float(v) for v in st.get("playing_region_mm", (-15.0, 150.0)))
+        return cls(points, float(vm["string_length"]), float(cfg["bow"]["hair_length"]), tilt, region)
+
+    def string_plane_normal(self, string: str | None) -> np.ndarray:
+        """Normal of the bowing plane for `string` (None = halfway between D and A), violin frame."""
+        a = np.radians(self.string_tilt_deg[string] if string else 0.0)
+        return np.array([0.0, np.sin(a), np.cos(a)])
 
     def parts(self) -> dict[str, np.ndarray]:
         """Outline polylines that follow this model's (possibly fitted) keypoints."""
@@ -239,8 +266,12 @@ class BowEstimate:
     angle_deg: float  # bow vs. strings, 90 = straight
     tilt_deg: float  # rotation out of the string plane (string crossing)
     angle_2d_deg: float  # same angle measured naively in the image
-    method: str  # "length", or "plane" (fallback / bow end clipped by the frame)
+    method: str  # "contact G" etc., "joint", "joint (clipped)", "contact (string unknown)", "length", "plane"
     length_residual_mm: float
+    string: str | None = None  # string assumed by the solver (None = unknown)
+    # Range of angles this bow line gives across the four strings' bowing
+    # planes: how much not knowing the string could matter in this view.
+    string_spread_deg: float = 0.0
 
 
 @dataclass
@@ -256,7 +287,7 @@ class FrameGeometry:
 # ---------------------------------------------------------------------------
 class GeometryEstimator:
     def __init__(self, model: ViolinModel, intrinsics: CameraIntrinsics, min_conf: float = 0.35,
-                 max_reproj_px: float = 25.0, outlier_px: float = 4.0, bow_solver: str = "joint",
+                 max_reproj_px: float = 25.0, outlier_px: float = 4.0, bow_solver: str = "auto",
                  sigma_length_mm: float = 25.0, sigma_tilt_deg: float = 12.0):
         self.model = model
         self.base_intrinsics = intrinsics
@@ -268,6 +299,10 @@ class GeometryEstimator:
         self.sigma_length_mm = sigma_length_mm
         self.sigma_tilt_deg = sigma_tilt_deg
         self._prev_pose: ViolinPose | None = None
+        # String being played, if known (set by the GUI from the user's
+        # choice). Read once per frame, so setting it from another
+        # thread is safe.
+        self.string: str | None = None
 
     def reset(self) -> None:
         self._prev_pose = None
@@ -312,19 +347,28 @@ class GeometryEstimator:
         K, dist = self.intrinsics.K, self.intrinsics.dist
 
         candidates = []
-        ok, rvec, tvec = cv2.solvePnP(obj, img, K, dist, flags=cv2.SOLVEPNP_SQPNP)
+        try:  # degenerate input (e.g. points almost on one line) makes OpenCV assert
+            ok, rvec, tvec = cv2.solvePnP(obj, img, K, dist, flags=cv2.SOLVEPNP_SQPNP)
+        except cv2.error:
+            ok = False
         if ok:
             candidates.append((rvec, tvec))
         if self._prev_pose is not None:  # temporal prior resolves near-planar flips
             rv0, _ = cv2.Rodrigues(self._prev_pose.R)
-            ok2, rv2, tv2 = cv2.solvePnP(obj, img, K, dist, rv0.copy(), self._prev_pose.t.reshape(3, 1).copy(),
-                                         useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE)
+            try:
+                ok2, rv2, tv2 = cv2.solvePnP(obj, img, K, dist, rv0.copy(), self._prev_pose.t.reshape(3, 1).copy(),
+                                             useExtrinsicGuess=True, flags=cv2.SOLVEPNP_ITERATIVE)
+            except cv2.error:
+                ok2 = False
             if ok2:
                 candidates.append((rv2, tv2))
 
         best = None
         for rvec, tvec in candidates:
-            rvec, tvec = cv2.solvePnPRefineLM(obj, img, K, dist, rvec, tvec)
+            try:
+                rvec, tvec = cv2.solvePnPRefineLM(obj, img, K, dist, rvec, tvec)
+            except cv2.error:
+                continue
             proj, _ = cv2.projectPoints(obj, rvec, tvec, K, dist)
             err = float(np.sqrt(np.mean(np.sum((proj.reshape(-1, 2) - img) ** 2, axis=1))))
             if tvec[2, 0] <= 0:
@@ -334,7 +378,12 @@ class GeometryEstimator:
         return best
 
     # -- bow -----------------------------------------------------------------
-    def estimate_bow(self, kp: Keypoints2D, pose: ViolinPose) -> BowEstimate | None:
+    def bow_direction_on_string(self, n: np.ndarray, pose: ViolinPose, string: str | None) -> np.ndarray:
+        """Bow direction resting on `string`: interpretation plane (normal n) ∩ that string's bowing plane."""
+        d = np.cross(n, pose.R @ self.model.string_plane_normal(string))
+        return d / np.linalg.norm(d)
+
+    def estimate_bow(self, kp: Keypoints2D, pose: ViolinPose, string: str | None = None) -> BowEstimate | None:
         frog_px, tip_px = kp.get("bow_frog").astype(np.float64), kp.get("bow_tip").astype(np.float64)
         if np.linalg.norm(tip_px - frog_px) < 5:
             return None
@@ -392,7 +441,24 @@ class GeometryEstimator:
         if not ok.any():
             return None
 
-        if self.bow_solver == "switch":  # legacy: length roots, else assume tilt = 0
+        def theta_of(d: np.ndarray) -> float:  # in-plane angle (a line: theta and theta+pi are the same)
+            return float(np.arctan2(d @ e2, d @ e1) % np.pi)
+
+        # Angle each string's bowing plane would give (diagnostic + spread).
+        per_string = []
+        for s in STRINGS:
+            d_s = self.bow_direction_on_string(n, pose, s)
+            per_string.append(float(np.degrees(np.arccos(np.clip(abs(d_s @ x_s), 0, 1)))))
+        spread = max(per_string) - min(per_string)
+
+        solver = self.bow_solver
+        if solver == "auto":
+            solver = "contact" if (string is not None or clipped) else "joint"
+
+        if solver == "contact":
+            theta = theta_of(self.bow_direction_on_string(n, pose, string))
+            method = f"contact {string}" if string else "contact (string unknown)"
+        elif solver == "switch":  # legacy: length roots, else assume tilt = 0
             err = np.where(ok, L_all - L0, np.nan)
             roots = [i for i in range(len(thetas) - 1)
                      if np.isfinite(err[i]) and np.isfinite(err[i + 1]) and np.sign(err[i]) != np.sign(err[i + 1])]
@@ -429,8 +495,18 @@ class GeometryEstimator:
 
         F_, T_, _, _, valid = geometry_at(theta)
         if not valid[0]:
-            return None
-        F, T = F_[0], T_[0]
+            # The frog/tip rays meet this line behind the camera on one side
+            # (bow line passes near the camera): fall back to the contact point
+            # plus direction, oriented frog -> tip in the image.
+            if solver != "contact":
+                return None
+            d = np.cos(theta) * e1 + np.sin(theta) * e2
+            p0, p1 = self.intrinsics.project(np.vstack([C, C + 10 * d]))
+            if (p1 - p0) @ (tip_px - frog_px) < 0:
+                d = -d
+            F, T = C - 250 * d, C + (L0 - 250) * d
+        else:
+            F, T = F_[0], T_[0]
 
         d = (T - F) / np.linalg.norm(T - F)
         angle = float(np.degrees(np.arccos(np.clip(d @ x_s, -1, 1))))
@@ -445,10 +521,13 @@ class GeometryEstimator:
             frog=F, tip=T, contact=C, contact_from_bridge_mm=float(lam), angle_deg=angle, tilt_deg=tilt,
             angle_2d_deg=a2d, method=method,
             length_residual_mm=float(np.linalg.norm(T - F) - self.model.bow_length),
+            string=string if solver == "contact" else None, string_spread_deg=spread,
         )
 
     # -- full frame ----------------------------------------------------------
-    def __call__(self, kp: Keypoints2D, frame_wh: tuple[int, int]) -> FrameGeometry:
+    def __call__(self, kp: Keypoints2D, frame_wh: tuple[int, int], string: str | None = None) -> FrameGeometry:
+        """`string` overrides `self.string` (the string being played, if known)."""
+        string = string or self.string
         self.intrinsics = self.base_intrinsics.scaled_to(*frame_wh)
         out = FrameGeometry()
         out.bow_visible = kp.visible("bow_frog", self.min_conf) and kp.visible("bow_tip", self.min_conf)
@@ -460,7 +539,12 @@ class GeometryEstimator:
         if not out.bow_visible:
             out.message = "no bow detected"
             return out
-        out.bow = self.estimate_bow(kp, out.pose)
+        out.bow = self.estimate_bow(kp, out.pose, string)
         if out.bow is None:
             out.message = "bow geometry degenerate"
+            return out
+        lo, hi = self.model.playing_region_mm
+        if not lo <= out.bow.contact_from_bridge_mm <= hi:
+            out.message = f"bow not on the strings ({out.bow.contact_from_bridge_mm:.0f} mm from the bridge)"
+            out.bow = None
         return out

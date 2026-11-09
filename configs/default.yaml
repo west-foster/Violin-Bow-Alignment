@@ -60,8 +60,39 @@ violin_measurements:
 
 bow:
   # Distance between the frog and tip keypoints (where the hair meets the
-  # frog ferrule and the tip). ~650 mm for a full-size bow.
+  # frog ferrule and the tip). ~650 mm for a full-size bow. Only used when the
+  # string being played is unknown and both bow ends are in view.
   hair_length: 650.0
+
+strings:
+  # Tilt of each string's bowing plane (deg, + toward the G side): the bridge
+  # is arched, so the bow rests at a different tilt on each string. With the
+  # string chosen in the GUI the bow angle follows from the bow's 2D line
+  # alone; with "Any" the middle plane is assumed (accurate from a good
+  # viewpoint, see positioning). No bow length or visible frog/tip needed.
+  tilt_deg: {G: 20.0, D: 7.0, A: -7.0, E: -20.0}
+  # The bow must cross the strings this far from the bridge (mm, + toward the
+  # fingerboard) to count as playing; outside it the banner goes black.
+  playing_region_mm: [-15.0, 150.0]
+
+audio:
+  # Sound gating: bow angle is only judged while a note sounds (the bow is
+  # then on a string). Only the level is used, not the pitch.
+  enabled: true           # the GUI checkbox's starting state
+  threshold_db: -45.0     # minimum level (dBFS) that counts as playing...
+  margin_db: 12.0         # ...and at least this far above the room's noise floor
+  hold_s: 0.15            # keep "playing" through short gaps (bow changes)
+
+positioning:
+  # Separate "how to stand" indicator. The bow-angle error from not knowing
+  # the string must stay below this, else it tells you to turn / raise the
+  # camera (the limit doubles when a single string is chosen in the GUI).
+  max_string_error_deg: 5.0
+  # Below this the violin is too small ("step closer"). 0.4 px/mm = ~2.3 m from a
+  # 70 deg 720p webcam; standing back far enough for the bow to fit is fine.
+  min_px_per_mm: 0.4
+  margin_frac: 0.03       # violin must stay this far inside the frame edges
+  window: 15              # frames of smoothing so the advice doesn't flicker
 
 feedback:
   target_angle_deg: 90.0

@@ -1,4 +1,4 @@
-"""Entry point:  python -m bowtrack.gui.app [--video FILE | --demo] [--checkpoint CKPT]"""
+"""Entry point:  python -m bowtrack.gui.app [--video FILE | --demo | --camera] [--model] [--checkpoint CKPT]"""
 
 from __future__ import annotations
 
@@ -18,12 +18,18 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--demo", action="store_true", help="start the synthetic demo")
     ap.add_argument("--camera", action="store_true", help="start the webcam on launch")
     ap.add_argument("--checkpoint", default=None, help="model checkpoint (.pt)")
+    ap.add_argument("--model", action="store_true", help="tick 'Apply model' on start (run the keypoint model)")
+    ap.add_argument("--no-sound", action="store_true", help="don't gate on sound / use the microphone")
     args = ap.parse_args(argv)
 
     app = QtWidgets.QApplication(sys.argv[:1])
     app.setApplicationName("bowtrack")
     win = MainWindow(load_config(args.config), checkpoint=args.checkpoint)
     win.show()
+    if args.no_sound:
+        win.chk_sound.setChecked(False)
+    if args.model:
+        win.chk_model.setChecked(True)
     if args.video:
         win.open_video(args.video)
     elif args.demo:

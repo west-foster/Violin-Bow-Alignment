@@ -62,8 +62,10 @@ KEYPOINT_HELP: dict[str, str] = {
     "corner_upper_treble": _CORNER.format(where="E-side corner nearest the neck (upper treble)"),
     "corner_lower_bass": _CORNER.format(where="G-side corner nearest the tailpiece (lower bass)"),
     "corner_lower_treble": _CORNER.format(where="E-side corner nearest the tailpiece (lower treble)"),
-    "bow_frog": "Where the hair meets the frog (front edge of the metal ferrule), usually just past your "
-                "thumb. Press N if your hand hides it completely.",
+    "bow_frog": "Where the hair meets the frog (front edge of the metal ferrule), just past your thumb. "
+                "If it's out of frame, click where the bow leaves the frame (snaps to the edge); if your "
+                "hand hides it, click where the hair disappears into the hand. The angle only needs the "
+                "bow's LINE, so any visible frog-side point works.",
     "bow_tip": "Where the hair meets the tip of the bow. If the tip is out of frame, click where the stick "
                "leaves the frame (clicks near the edge snap to it).",
 }

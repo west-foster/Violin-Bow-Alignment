@@ -67,16 +67,28 @@ class KeypointDataset(Dataset):
         return normalize(inp), torch.from_numpy(target), torch.from_numpy(xy_in), torch.from_numpy(vis)
 
 
-def split_entries(entries: list[dict], val_frac: float = 0.15, seed: int = 0) -> tuple[list[dict], list[dict]]:
-    """Split by recording (take) so near-duplicate consecutive frames don't leak into validation."""
-    takes = sorted({e["file"].rsplit("_", 1)[0] for e in entries})
+def split_entries(entries: list[dict], val_frac: float = 0.15, seed: int = 0,
+                  min_takes: int = 6) -> tuple[list[dict], list[dict]]:
+    """Train / validation split that keeps near-duplicate neighbouring frames apart.
+
+    With many takes, whole takes are held out. With few (a take can hold most
+    of the data), the last `val_frac` of each take's labelled frames (by frame
+    number) is held out instead, so every take is in both sets.
+    """
+    def take(e):
+        return e["file"].rsplit("_", 1)[0]
+
+    takes = sorted({take(e) for e in entries})
     rng = np.random.default_rng(seed)
-    if len(takes) >= 3:
+    if len(takes) >= min_takes:
         rng.shuffle(takes)
         n_val = max(1, round(len(takes) * val_frac))
         val_takes = set(takes[:n_val])
-        return ([e for e in entries if e["file"].rsplit("_", 1)[0] not in val_takes],
-                [e for e in entries if e["file"].rsplit("_", 1)[0] in val_takes])
-    idx = rng.permutation(len(entries))
-    n_val = max(1, round(len(entries) * val_frac))
-    return [entries[i] for i in idx[n_val:]], [entries[i] for i in idx[:n_val]]
+        return ([e for e in entries if take(e) not in val_takes], [e for e in entries if take(e) in val_takes])
+    train, val = [], []
+    for t in takes:
+        es = sorted((e for e in entries if take(e) == t), key=lambda e: e["file"])
+        n_val = int(round(len(es) * val_frac)) if len(es) >= 4 else 0
+        train += es[:len(es) - n_val]
+        val += es[len(es) - n_val:]
+    return train, val
